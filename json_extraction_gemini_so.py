@@ -1,7 +1,6 @@
 import json
 import csv
 import os
-import glob
 import time
 from typing import List, Optional
 from pydantic import BaseModel, Field
@@ -13,6 +12,7 @@ class CaseEvent(BaseModel):
     action: str = Field(description="Summary of the event, e.g., Warrant issued, Recommendation sent")
 
 class PersonRecord(BaseModel):
+    id: str = Field(description="Identifier of the individual, this usually precedes the name and is typically of the format ###-#### or ####")
     name: str = Field(description="Full name of the individual")
     alias: Optional[str] = Field(None, description="Alias or other names if mentioned")
     location: Optional[str] = Field(None, description="City and State mentioned (e.g., St. Louis, Mo.)")
@@ -25,28 +25,25 @@ class ExtractionResponse(BaseModel):
     people: List[PersonRecord]
 
 # 2. Gemini API Configuration
-# Use uv add google-genai to install the necessary library
 apiKey = os.getenv("GEMINI_API_KEY", "")
-MODEL_ID = "gemini-2.5-flash-preview-09-2025" # Or gemini-2.5-flash-preview-09-2025 once generally available in the SDK
+MODEL_ID = "gemini-3-flash-preview" 
 
-# Initialize the Google GenAI client
 client = genai.Client(api_key=apiKey)
 
 def extract_structured_data(ocr_text):
     """
-    Sends text to Gemini API using the google-genai SDK with native structured outputs.
+    Sends a single text entry to Gemini for extraction.
     """
     if not apiKey:
         raise ValueError("API Key is missing. Please set the GEMINI_API_KEY environment variable.")
     
     prompt = (
-        "Extract the primary individuals and their legal chronology from these warrant logs. "
-        "Include dates for all events. Ignore administrative staff or officials unless "
-        "they are the subject of the warrant.\n\n"
+        "You are a specialized historical researcher. Extract every individual from the following arrest warrant log text. "
+        "Pay attention to case IDs (###-####) and clerk shorthand for nationalities. "
+        "Ignore administrative staff unless they are the primary subject of a warrant.\n\n"
         f"LOG TEXT:\n{ocr_text}"
     )
 
-    # Exponential Backoff Implementation
     for i in range(6):
         try:
             response = client.models.generate_content(
@@ -57,8 +54,6 @@ def extract_structured_data(ocr_text):
                     "response_schema": ExtractionResponse.model_json_schema(),
                 },
             )
-            
-            # Use model_validate_json to turn the response string into Pydantic objects
             return ExtractionResponse.model_validate_json(response.text)
             
         except Exception as e:
@@ -70,48 +65,51 @@ def extract_structured_data(ocr_text):
             
     return ExtractionResponse(people=[])
 
-# 3. Processing a Directory of JSONL Files
-input_folder = './data/test_json/' 
+# 3. Processing the Large JSONL File
+input_file = './data/test_json/test_25.jsonl'
 output_file = 'warrant_results.csv'
 all_records = []
 
-jsonl_files = sorted(glob.glob(os.path.join(input_folder, "*.jsonl")))
-
-if not jsonl_files:
-    print(f"Error: No .jsonl files found in {input_folder}")
+if not os.path.exists(input_file):
+    print(f"Error: File not found at {input_file}")
 else:
-    print(f"Starting Gemini extraction from {len(jsonl_files)} files...")
+    print(f"Starting extraction from {input_file}...")
     
-    for file_path in jsonl_files:
-        file_name = os.path.basename(file_path)
-        print(f"\n--- Opening File: {file_name} ---")
-        
-        with open(file_path, 'r') as f:
-            for i, line in enumerate(f):
-                try:
-                    line_data = json.loads(line)
-                    source_pdf = line_data.get('metadata', {}).get('Source-File', 'Unknown')
+    with open(input_file, 'r') as f:
+        for i, line in enumerate(f):
+            if not line.strip(): continue
+            
+            try:
+                line_data = json.loads(line)
+                # Pull source file directly from JSONL metadata (Loop Logic)
+                source_pdf = line_data.get('metadata', {}).get('Source-File', 'Unknown')
+                raw_text = line_data.get('text', '')
+                
+                print(f"Processing Entry {i+1} (Source: {source_pdf})...")
+                
+                # Send strictly this entry's text to the model
+                result = extract_structured_data(raw_text)
+                
+                for person in result.people:
+                    print(f"  > Found: {person.name} ({person.id})")
                     
-                    print(f"Processing Entry {i+1} (Source: {source_pdf})...")
+                    record_dict = person.model_dump()
+                    # Assign metadata in the loop, ensuring 100% accuracy
+                    record_dict['source_file'] = source_pdf
+                    # Append raw JSON for troubleshooting as requested
+                    record_dict['raw_json_input'] = json.dumps(line_data)
+                    all_records.append(record_dict)
                     
-                    result = extract_structured_data(line_data['text'])
-                    
-                    for person in result.people:
-                        print(f"  > Found: {person.name}")
-                        record_dict = person.model_dump()
-                        record_dict['source_file'] = source_pdf
-                        record_dict['original_jsonl'] = file_name
-                        all_records.append(record_dict)
-                        
-                except Exception as e:
-                    print(f"  !! Error on line {i+1} of {file_name}: {e}")
+            except Exception as e:
+                print(f"  !! Error on line {i+1}: {e}")
 
     # 4. Save to CSV
     if all_records:
         with open(output_file, 'w', newline='') as csvfile:
             fieldnames = [
-                'name', 'alias', 'location', 'nationality', 
-                'final_status', 'final_status_date', 'source_file', 'original_jsonl', 'chronology'
+                'id', 'name', 'alias', 'location', 'nationality', 
+                'final_status', 'final_status_date', 'source_file', 
+                'chronology', 'raw_json_input'
             ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
@@ -121,6 +119,7 @@ else:
                 event_str = " | ".join([f"{e.get('date') or 'No Date'}: {e.get('action') or 'No Action'}" for e in events])
                 
                 writer.writerow({
+                    'id': r['id'],
                     'name': r['name'],
                     'alias': r['alias'],
                     'location': r['location'],
@@ -128,10 +127,8 @@ else:
                     'final_status': r['final_status'],
                     'final_status_date': r['final_status_date'],
                     'source_file': r['source_file'],
-                    'original_jsonl': r['original_jsonl'],
-                    'chronology': event_str
+                    'chronology': event_str,
+                    'raw_json_input': r['raw_json_input']
                 })
         
-        print(f"\nFinished! Extracted {len(all_records)} total records from {len(jsonl_files)} files to {output_file}")
-    else:
-        print("\nNo records were extracted.")
+        print(f"\nFinished! Extracted {len(all_records)} total records to {output_file}")
