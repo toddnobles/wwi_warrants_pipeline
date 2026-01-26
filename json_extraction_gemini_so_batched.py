@@ -14,13 +14,13 @@ class CaseEvent(BaseModel):
 class PersonRecord(BaseModel):
     # We add this field so the model can link the person back to the specific text block in the batch
     text_block_index: int = Field(description="The index number (0, 1, 2...) of the text block where this individual was found.")
-    id: str = Field(description="Identifier of the individual, typically format ###-#### or ####")
+    id: str = Field(description="Identifier of the individual, typically format ###-#### or ####. If unknown or missing, return 'Unknown'.")
     name: str = Field(description="Full name of the individual")
     alias: Optional[str] = Field(None, description="Alias or other names if mentioned")
     location: Optional[str] = Field(None, description="City and State mentioned (e.g., St. Louis, Mo.)")
     nationality: Optional[str] = Field(None, description="Nationality if listed (e.g., Ger, Austrian, gen)")
     final_status: Optional[str] = Field("Unknown", description="Final disposition: e.g., Paroled, Insane, Released, To War")
-    final_status_date: Optional[str] = Field(None, description="The date the final status was reached")
+    final_status_date: Optional[str] = Field(None, description="The date the final status was reached. Use the context of preceding dates to determine the year if the dates are listed as MM-DD only.")
     events: List[CaseEvent] = Field(default_factory=list, description="Chronological list of all events for this person")
 
 class ExtractionResponse(BaseModel):
@@ -76,6 +76,7 @@ def extract_from_batch(batch_texts: List[str]):
 input_file = './data/test_json/test_25.jsonl'
 output_file = 'warrant_results_25_batch_context_v2.csv'
 checkpoint_file = 'checkpoint.txt'
+log_file = 'processing_log.txt'
 BATCH_SIZE = 10 # Adjust this to change how much context the model sees (10-20 is usually good)
 
 # --- RESILIENCE SETUP ---
@@ -102,13 +103,16 @@ else:
     with open(output_file, csv_mode, newline='') as csvfile:
         fieldnames = [
             'id', 'name', 'alias', 'location', 'nationality', 
-            'final_status', 'final_status_date',
+            'final_status', 'final_status_date', 'source_file',
             'chronology', 'raw_json_input', 'text_block_index'
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
         if write_header:
             writer.writeheader()
+            # If we are starting fresh, clear the log file too
+            if os.path.exists(log_file):
+                os.remove(log_file)
         
         with open(input_file, 'r') as f:
             # Buffer to hold lines until we reach BATCH_SIZE
@@ -134,6 +138,9 @@ else:
                         # Call API
                         result = extract_from_batch(text_batch)
                         
+                        # Track names processed in this batch for the log
+                        processed_names_log = []
+
                         # Map results back to metadata using the index
                         for person in result.people:
                             idx = person.text_block_index
@@ -148,8 +155,7 @@ else:
                                 
                                 record_dict = person.model_dump()
                                 # STRICT METADATA ASSIGNMENT HERE
-                                # (Note: source_file is not in your fieldnames, so we skip adding it to dict to avoid error
-                                # but we use it for logging above. 'raw_json_input' is in fieldnames.)
+                                record_dict['source_file'] = source_pdf
                                 record_dict['raw_json_input'] = raw_json
                                 
                                 # Convert events list to string
@@ -162,12 +168,20 @@ else:
                                     del record_dict['events']
                                 
                                 writer.writerow(record_dict)
+                                processed_names_log.append(f"{person.name} ({person.id})")
                             else:
                                 print(f"  !! Warning: Model returned invalid block index {idx} for {person.name}")
 
                         # FLUSH data to disk immediately (Safe against crashes)
                         csvfile.flush()
                         
+                        # UPDATE LOG FILE
+                        with open(log_file, 'a') as lf:
+                            lf.write(f"Batch ending at line {i+1}:\n")
+                            for name in processed_names_log:
+                                lf.write(f"  - {name}\n")
+                            lf.write("-" * 20 + "\n")
+
                         # UPDATE CHECKPOINT
                         # We save the index of the next line to be processed (i + 1)
                         with open(checkpoint_file, 'w') as cf:
@@ -184,12 +198,17 @@ else:
                 print(f"Processing Final Batch ({len(batch_buffer)} items)...")
                 text_batch = [item.get('text', '') for item in batch_buffer]
                 result = extract_from_batch(text_batch)
+                
+                processed_names_log = []
+                
                 for person in result.people:
                     idx = person.text_block_index
                     if 0 <= idx < len(batch_buffer):
                         source_data = batch_buffer[idx]
                         record_dict = person.model_dump()
                         
+                        source_pdf = source_data.get('metadata', {}).get('Source-File', 'Unknown')
+                        record_dict['source_file'] = source_pdf
                         record_dict['raw_json_input'] = json.dumps(source_data)
                         
                         events = record_dict.get('events', [])
@@ -201,8 +220,17 @@ else:
                             del record_dict['events']
                         
                         writer.writerow(record_dict)
+                        processed_names_log.append(f"{person.name} ({person.id})")
                 
                 csvfile.flush()
+                
+                # Update Log for final batch
+                with open(log_file, 'a') as lf:
+                    lf.write(f"Final Batch ending at line {i+1}:\n")
+                    for name in processed_names_log:
+                        lf.write(f"  - {name}\n")
+                    lf.write("--- EXTRACTION COMPLETE ---\n")
+
                 # Update checkpoint one last time
                 with open(checkpoint_file, 'w') as cf:
                     cf.write(str(i + 1))
