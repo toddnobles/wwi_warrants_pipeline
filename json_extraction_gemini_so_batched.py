@@ -73,8 +73,8 @@ def extract_from_batch(batch_texts: List[str]):
     return ExtractionResponse(people=[])
 
 # 3. Processing the Large JSONL File with Batches
-input_file = './data/test_json/test_25.jsonl'
-output_file = 'warrant_results_25_batch_context_v2.csv'
+input_file = './data/individual_narratives.jsonl'
+output_file = 'warrant_results_20260126.csv'
 checkpoint_file = 'checkpoint.txt'
 log_file = 'processing_log.txt'
 BATCH_SIZE = 10 # Adjust this to change how much context the model sees (10-20 is usually good)
