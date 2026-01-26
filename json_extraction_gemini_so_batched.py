@@ -30,8 +30,6 @@ class ExtractionResponse(BaseModel):
 apiKey = os.getenv("GEMINI_API_KEY", "")
 MODEL_ID = "gemini-3-flash-preview" 
 
-
-
 client = genai.Client(api_key=apiKey)
 
 def extract_from_batch(batch_texts: List[str]):
@@ -77,100 +75,136 @@ def extract_from_batch(batch_texts: List[str]):
 # 3. Processing the Large JSONL File with Batches
 input_file = './data/test_json/test_25.jsonl'
 output_file = 'warrant_results_25_batch_context_v2.csv'
+checkpoint_file = 'checkpoint.txt'
 BATCH_SIZE = 10 # Adjust this to change how much context the model sees (10-20 is usually good)
-all_records = []
+
+# --- RESILIENCE SETUP ---
+# Check for existing checkpoint to resume from
+start_line = 0
+if os.path.exists(checkpoint_file):
+    try:
+        with open(checkpoint_file, 'r') as f:
+            start_line = int(f.read().strip())
+            print(f"Found checkpoint. Resuming from line {start_line}...")
+    except ValueError:
+        print("Checkpoint file corrupt. Starting from beginning.")
+
+# Determine CSV mode: 'a' (append) if resuming, 'w' (write) if new
+write_header = not os.path.exists(output_file) or start_line == 0
+csv_mode = 'a' if not write_header else 'w'
 
 if not os.path.exists(input_file):
     print(f"Error: File not found at {input_file}")
 else:
     print(f"Starting batch extraction from {input_file}...")
     
-    with open(input_file, 'r') as f:
-        # Buffer to hold lines until we reach BATCH_SIZE
-        batch_buffer = [] 
+    # Open the CSV file ONCE in append/write mode
+    with open(output_file, csv_mode, newline='') as csvfile:
+        fieldnames = [
+            'id', 'name', 'alias', 'location', 'nationality', 
+            'final_status', 'final_status_date',
+            'chronology', 'raw_json_input', 'text_block_index'
+        ]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
-        for i, line in enumerate(f):
-            if not line.strip(): continue
-            try:
-                line_data = json.loads(line)
-                batch_buffer.append(line_data)
-                
-                # Check if batch is full
-                if len(batch_buffer) >= BATCH_SIZE:
-                    print(f"Processing Batch (Lines {i+1-BATCH_SIZE} to {i+1})...")
-                    
-                    # Extract just the text for the model
-                    text_batch = [item.get('text', '') for item in batch_buffer]
-                    
-                    # Call API
-                    result = extract_from_batch(text_batch)
-                    
-                    # Map results back to metadata using the index
-                    for person in result.people:
-                        idx = person.text_block_index
-                        
-                        # Safety check: ensure index is valid for this batch
-                        if 0 <= idx < len(batch_buffer):
-                            source_data = batch_buffer[idx]
-                            source_pdf = source_data.get('metadata', {}).get('Source-File', 'Unknown')
-                            raw_json = json.dumps(source_data)
-                            
-                            print(f"  > Found: {person.name} (Block {idx} -> {source_pdf})")
-                            
-                            record_dict = person.model_dump()
-                            # STRICT METADATA ASSIGNMENT HERE
-                            record_dict['source_file'] = source_pdf
-                            record_dict['raw_json_input'] = raw_json
-                            all_records.append(record_dict)
-                        else:
-                            print(f"  !! Warning: Model returned invalid block index {idx} for {person.name}")
-
-                    # Clear buffer
-                    batch_buffer = []
-
-            except json.JSONDecodeError:
-                print(f"Skipping invalid JSON on line {i+1}")
-
-        # Process remaining items in buffer (if any)
-        if batch_buffer:
-            print(f"Processing Final Batch ({len(batch_buffer)} items)...")
-            text_batch = [item.get('text', '') for item in batch_buffer]
-            result = extract_from_batch(text_batch)
-            for person in result.people:
-                idx = person.text_block_index
-                if 0 <= idx < len(batch_buffer):
-                    source_data = batch_buffer[idx]
-                    record_dict = person.model_dump()
-                    record_dict['source_file'] = source_data.get('metadata', {}).get('Source-File', 'Unknown')
-                    record_dict['raw_json_input'] = json.dumps(source_data)
-                    all_records.append(record_dict)
-
-    # 4. Save to CSV
-    if all_records:
-        with open(output_file, 'w', newline='') as csvfile:
-            fieldnames = [
-                'id', 'name', 'alias', 'location', 'nationality', 
-                'final_status', 'final_status_date',
-                'chronology', 'raw_json_input', 'text_block_index'
-            ]
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        if write_header:
             writer.writeheader()
-            
-            for r in all_records:
-                events = r.get('events', [])
-                event_str = " | ".join([f"{e.get('date') or 'No Date'}: {e.get('action') or 'No Action'}" for e in events])
-                
-                writer.writerow({
-                    'id': r['id'],
-                    'name': r['name'],
-                    'alias': r['alias'],
-                    'location': r['location'],
-                    'nationality': r['nationality'],
-                    'final_status': r['final_status'],
-                    'final_status_date': r['final_status_date'],
-                    'chronology': event_str,
-                    'raw_json_input': r['raw_json_input'],
-                    'text_block_index': r.get('text_block_index')
-                })
         
-        print(f"\nFinished! Extracted {len(all_records)} total records to {output_file}")
+        with open(input_file, 'r') as f:
+            # Buffer to hold lines until we reach BATCH_SIZE
+            batch_buffer = [] 
+            
+            for i, line in enumerate(f):
+                # SKIP lines we have already processed
+                if i < start_line:
+                    continue
+
+                if not line.strip(): continue
+                try:
+                    line_data = json.loads(line)
+                    batch_buffer.append(line_data)
+                    
+                    # Check if batch is full
+                    if len(batch_buffer) >= BATCH_SIZE:
+                        print(f"Processing Batch (Lines {i+1-BATCH_SIZE} to {i+1})...")
+                        
+                        # Extract just the text for the model
+                        text_batch = [item.get('text', '') for item in batch_buffer]
+                        
+                        # Call API
+                        result = extract_from_batch(text_batch)
+                        
+                        # Map results back to metadata using the index
+                        for person in result.people:
+                            idx = person.text_block_index
+                            
+                            # Safety check: ensure index is valid for this batch
+                            if 0 <= idx < len(batch_buffer):
+                                source_data = batch_buffer[idx]
+                                source_pdf = source_data.get('metadata', {}).get('Source-File', 'Unknown')
+                                raw_json = json.dumps(source_data)
+                                
+                                print(f"  > Found: {person.name} (Block {idx} -> {source_pdf})")
+                                
+                                record_dict = person.model_dump()
+                                # STRICT METADATA ASSIGNMENT HERE
+                                # (Note: source_file is not in your fieldnames, so we skip adding it to dict to avoid error
+                                # but we use it for logging above. 'raw_json_input' is in fieldnames.)
+                                record_dict['raw_json_input'] = raw_json
+                                
+                                # Convert events list to string
+                                events = record_dict.get('events', [])
+                                event_str = " | ".join([f"{e.get('date') or 'No Date'}: {e.get('action') or 'No Action'}" for e in events])
+                                record_dict['chronology'] = event_str
+                                
+                                # Clean up dict for CSV writing (remove non-field keys)
+                                if 'events' in record_dict:
+                                    del record_dict['events']
+                                
+                                writer.writerow(record_dict)
+                            else:
+                                print(f"  !! Warning: Model returned invalid block index {idx} for {person.name}")
+
+                        # FLUSH data to disk immediately (Safe against crashes)
+                        csvfile.flush()
+                        
+                        # UPDATE CHECKPOINT
+                        # We save the index of the next line to be processed (i + 1)
+                        with open(checkpoint_file, 'w') as cf:
+                            cf.write(str(i + 1))
+
+                        # Clear buffer
+                        batch_buffer = []
+
+                except json.JSONDecodeError:
+                    print(f"Skipping invalid JSON on line {i+1}")
+
+            # Process remaining items in buffer (if any)
+            if batch_buffer:
+                print(f"Processing Final Batch ({len(batch_buffer)} items)...")
+                text_batch = [item.get('text', '') for item in batch_buffer]
+                result = extract_from_batch(text_batch)
+                for person in result.people:
+                    idx = person.text_block_index
+                    if 0 <= idx < len(batch_buffer):
+                        source_data = batch_buffer[idx]
+                        record_dict = person.model_dump()
+                        
+                        record_dict['raw_json_input'] = json.dumps(source_data)
+                        
+                        events = record_dict.get('events', [])
+                        event_str = " | ".join([f"{e.get('date') or 'No Date'}: {e.get('action') or 'No Action'}" for e in events])
+                        record_dict['chronology'] = event_str
+                        
+                        # Clean up dict for CSV writing
+                        if 'events' in record_dict:
+                            del record_dict['events']
+                        
+                        writer.writerow(record_dict)
+                
+                csvfile.flush()
+                # Update checkpoint one last time
+                with open(checkpoint_file, 'w') as cf:
+                    cf.write(str(i + 1))
+
+    print(f"\nFinished! Results saved to {output_file}")
